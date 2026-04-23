@@ -16,11 +16,12 @@ class CarController(CarControllerBase):
     actuators = CC.actuators
     can_sends: list = []
 
-    # NOTE: R5 LKA_CMD (0x134 byte 10 TORQUE_CMD) additionally requires a SecOC MAC
-    # at bytes 16-17 that has not yet been reverse-engineered. Until the MAC is
-    # cracked, this car port is DASHCAM ONLY (dashcamOnly=True in interface.py)
-    # and no LKA frames are actually transmitted. The scaffolding below mirrors
-    # the MG/BYD shape so the interface passes opendbc test_car_interfaces.
+    # This car port is DASHCAM ONLY (dashcamOnly=True in interface.py); no LKA
+    # frames are actually transmitted yet. The scaffolding below mirrors the
+    # MG/BYD shape so the interface passes opendbc test_car_interfaces.
+    # 0x134 CHECKSUM (byte 16, CRC-8 poly 0x1D, XOR 0xEB over bytes[17:24]) is
+    # handled automatically by the DBC + CANPacker once tx is enabled; the
+    # follow-up work is the safety module and an active carcontroller impl.
     if self.frame % CarControllerParams.STEER_STEP == 0:
       if CC.latActive:
         new_torque = int(round(actuators.torque * CarControllerParams.STEER_MAX))
@@ -32,8 +33,9 @@ class CarController(CarControllerBase):
         apply_torque = 0
 
       self.apply_torque_last = apply_torque
-      # TODO: once SecOC MAC is cracked, build the 0x134 LKA_CMD frame here
-      # and append to can_sends.
+      # TODO: build the 0x134 LKA_CMD frame here (TORQUE_CMD at byte 10,
+      # CHECKSUM at byte 16, COUNTER at byte 17 high nibble) and append to
+      # can_sends once the safety module is in place.
 
     new_actuators = actuators.as_builder()
     new_actuators.torque = self.apply_torque_last / CarControllerParams.STEER_MAX

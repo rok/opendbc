@@ -11,8 +11,11 @@ class CarInterface(CarInterfaceBase):
   @staticmethod
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
     ret.brand = "renault"
-    # Dashcam-only until the 0x134 LKA_CMD SecOC MAC is reverse-engineered and
-    # safety hooks are validated on-vehicle.
+    # Dashcam-only until the safety module (opendbc/safety/modes/renault.h) and
+    # an active carcontroller are wired up and validated on-vehicle. The 0x134
+    # LKA_CMD checksum was cracked 2026-04-23 (standard Renault CRC-8, XOR 0xEB,
+    # body=bytes[17:24]) so transmit-path work is no longer cryptographically
+    # blocked — just requires the usual controls-allowed wiring.
     ret.dashcamOnly = True
 
     ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.noOutput)]

@@ -206,8 +206,11 @@ critical for openpilot lateral control:
   0x616, 0x62B, 0x631, 0x665, 0x67A, 0x691, 0x692, 0x6AD, + misc 6xx range.
 Extended 29-bit IDs 0x1BDE62F2, 0x1BDEF262 appeared in 2 sessions (likely
 FOB or UDS diagnostic responses).
-0x422 and 0x496 have CRC+COUNTER+SecOC-MAC-like structure; 0x300 broadcasts
-static calibration data (first and last frame identical across 113k frames).
+0x422 and 0x496 have CRC+COUNTER+(trailing bytes)-like structure — not yet
+decoded. Given 0x134 turned out to be a tail-positioned standard CRC, these
+are worth re-testing with the same brute-force approach before assuming any
+cryptographic protection. 0x300 broadcasts static calibration data (first
+and last frame identical across 113k frames).
 
 == Non-scalar fields (do NOT treat as signals) ==
   - 0x134 byte 16 is the STANDARD Renault CRC-8 CHECKSUM (poly 0x1D, XOR 0xEB,
