@@ -1,0 +1,617 @@
+CM_ "Renault 5 E-Tech (CMF-BEV) reverse-engineering sketch, rev 4 (2026-04-22).
+Two physical buses observed in the 2026-04-19 cabana session:
+  bus 0 - 'HS-CAN / powertrain+chassis FD', ~64 addresses
+  bus 1 - 'ITS2-FD / body+ADAS FD',         ~113 addresses
+Renault convention (observed across every periodic message with a counter):
+  - 4-bit message counter in the HIGH nibble of byte 5 (bits 47..44)
+  - checksum byte (8-bit) immediately before the counter byte
+
+CHECKSUM ALGORITHM: CRACKED (2026-04-22). Identical to GWM Haval H6:
+  CRC-8 polynomial 0x1D, init 0, XOR-output with per-message constant.
+  Data covers 7 bytes (matches GWM's dat[N+1:N+8] convention).
+```
+def renault_checksum(data_7_bytes, xor_out):
+    crc = 0
+    poly = 0x1D
+    for byte in data_7_bytes:
+        crc ^= byte
+        for _ in range(8):
+            crc = ((crc << 1) ^ poly) if (crc & 0x80) else (crc << 1)
+            crc &= 0xFF
+    return crc ^ xor_out
+```
+Validated at 100.0000% match across 19M+ frames / 173 segments / 20 active
+drives on 20 of 21 messages. Only 0x546 shows 99.93% (11 corrupted frames
+out of 15203 - likely transmission errors at drive boundaries). Six of the
+26 recorded sessions were EMPTY (panda connection failures).
+
+XOR constants per (msg, subframe_index):
+  0x08C A=0xF5 | 0x12F A=0x74 | 0x17C A=0x52 | 0x44C A=0x08
+  0x453 A=0xD3 | 0x5CF A=0xEB
+  0x1AB A=0x6A B=0x17 C=0xCC  (3-subframe, checksums at bytes 4/14/26)
+  0x226 A=0x97 B=0x08 C=0x76  (3-subframe, checksums at bytes 4/23/35)
+  0x112 A=0x7E B=0xA2 C=0x2A D=0xC7  (4-subframe, checksums at 4/13/23/33)
+  0x455 A=0x0C | 0x534 A=0x47 | 0x5E4 A=0x3C
+  0x434 A=0x22 | 0x546 A=0x2D
+Failed to match (likely non-standard or no CRC): 0x193, 0x21C, 0x25F,
+  0x298, 0x3AC, 0x3E6, 0x422, 0x666 - these "checksums" at byte 4 are
+  probably something else (rolling codes or data).
+
+Note: 0x226 subframe B/C have the checksum byte AFTER the data bytes (not
+before), unlike the typical GWM convention. This still works with the same
+algorithm - just different byte ordering.
+Multi-subframe CAN-FD frames repeat that (CHECKSUM, COUNTER) pattern every
+10 or 16 bytes; see 0x112 (4 subframes), 0x1AB (3 subframes), 0x226 (3 subframes).
+Address-on-both-buses conflicts: 0x534 is 12B on bus 0 vs 24B on bus 1 -
+this file describes the bus 1 variant.
+
+Intentional signal overlaps (present to allow both byte-level and bit-level
+views of the same data; not a decoding error):
+  - 0x134.BYPASSME_SECOC_MAC covers bytes 16-17 including byte 17 high nibble
+    where COUNTER lives (SecOC MAC is computed OVER the counter, so they share).
+  - 0x58B.TURN_SIGNAL_BYTE11 is the full byte-level view of byte 11; bit 1 is
+    extracted separately as TURN_SIGNAL_RIGHT.
+  - 0x588.STATUS_B_BYTE19 is the byte-level view; bit 1 is TURN_SIGNAL_RIGHT_ECHO.
+  - 0x302.OBJ_B_BYTE37_2 and OBJ_B_BYTE37 are two separate sub-fields of byte 37.
+
+== Signals needed for openpilot lateral control (status) ==
+FOUND:
+  - STEER_ANGLE       = 0x1AB.STEER_ANGLE     (bus 0, 100Hz, 0.1 deg; also 0x112.STEER_ANGLE_1/2)
+  - STEER_RATE        = 0x1AB.STEER_RATE      (bus 0, 100Hz, 0.01 deg/s; also 0x112 8-bit)
+  - DRIVER_TORQUE     = 0x17C.DRIVER_TORQUE   (bus 0, 100Hz, 16-bit biased-unsigned, zero-centered, Nissan-style)
+  - LKAS_TORQUE_CMD   = 0x1AB byte 7          (8-bit with offset -150, zero-centered)
+  - LKAS_STATE        = 0x1AB byte 9 bits 1-2 (2-bit enum: 1=active/ready, 2=suppressed-by-driver, 3=unavailable)
+  - VEHICLE_SPEED     = 0x3FA.VEHICLE_SPEED_HIGH_RES (13-bit) + VEHICLE_SPEED_KPH (8-bit)
+                        NOTE: 0x226.UNK_SPEED_LIKE_A/B do NOT cleanly decode as km/h
+                        (29.2 baseline at rest, 1.5x ratio vs actual speed).
+  - WHEEL_SPEED_*     = 0x226.WHEEL_SPEED_{FL,FR,RL,RR}
+  - GEAR              = 0x12F.GEAR_STATE {1=R, 2=N, 3=B, 8=D} + PARK_ACTIVE
+                        Plus redundant 0x44C.GEAR_DIRECTION (2-bit enum: REVERSE/STATIONARY_PN/FORWARD_DB)
+                        Plus 0x453.REVERSE_LIGHT (1-bit, R-only)
+                        Plus 0x224.GEAR_SELECTED (not-neutral flag)
+                        Plus 0x112.FORWARD_GEAR_ACTIVE (D or B active)
+    All 5 gears validated across 149 segments + dedicated gear-test drive.
+  - ACCEL_PEDAL       = 0x08C.ACCEL_PEDAL     (bus 0, 100Hz, 0-100%)
+                        + 0x3FA.ACCEL_PEDAL_LOW_RATE (derived/smoothed)
+  - BRAKE_PRESSED     = 0x112.BRAKE_PRESSED   (bus 1, 100Hz, 1-bit; low-rate echo at 0x666 byte 5 bit 3)
+  - BRAKE_PRESSURE    = 0x224.BRAKE_PRESSURE  (bus 1, ~50Hz, 8-bit 0-255 raw pedal position)
+    Analog brake pedal position, validated on 6 driving sessions incl. the
+    progressive-brake modulation in 2026-04-17--21-15-57 (t=12-17s window
+    shows full 0-255 modulation pattern during a 5s brake press).
+  - LONG_ACCEL        = 0x112.LONG_ACCEL      (bus 1, 100Hz, 10-bit, 0.02 m/s^2)
+  - TURN_SIGNAL_RIGHT = 0x58B.TURN_SIGNAL_RIGHT (bus 0, 10Hz, byte 11 bit 1)
+                        Echo candidate in 0x588 byte 19 bit 1 (corr +0.38, weak)
+  - TURN_SIGNAL_LEFT  = 0x112.TURN_SIGNAL_LEFT (bus 1, 100Hz, byte 14 bit 0; DUP at byte 24 bit 0)
+                        LEFT is NOT at 0x58B - R5 splits L/R across different messages.
+  - LKA_CMD.TORQUE_CMD = 0x134 byte 10 (bus 0, 100Hz, 24B) - validated end-to-end
+                        Zero when disengaged; nonzero 3-5% of engaged frames during lane-drift corrections.
+                        Bytes 16-17 are SecOC MAC + counter (NOT a control quantity).
+  - ACC_SET_SPEED     = 0x5EF.SET_SPEED + SET_SPEED_DUP (bus 0, 1Hz, 8B km/h);
+                        also redundantly at 0x3E6.SET_SPEED.
+  - ADAS_ENGAGED      = 0x4B5 byte 0 (8-bit multi-valued; 0 = off, 44-58 observed = engaged levels)
+  - FOLLOW_DISTANCE   = 0x4D1 byte 3 bits 3-4 (2-bit enum: 0=UNSET, 1=NEAR, 2=MID, 3=FAR)
+  - CRUISE_BUTTONS    = 0x4D1 bytes 5-6 (BUTTON_A_RES, B_SPEED, C_SET, D_CANCEL - bit-level)
+  - MOTOR_RPM         = 0x67D.MOTOR_RPM       (both buses, 2Hz)
+
+== Signals found in 2026-04-21 engaged session ==
+  - ADAS_ENGAGED    = 0x4B5.ADAS_ENGAGED   (byte 0, ALWAYS 0 in unengaged OLD
+    session, ALWAYS non-zero in NEW session during sustained ~4min engagement).
+    This is the cleanest engagement-mode flag found - a single byte value
+    distinguishing "ADAS armed/active" (non-zero) from "ADAS off" (zero).
+    Multi-valued (observed 0..58) so decode further into state enum later.
+  - LANE_DETECTED   = 0x314.LANE_DETECTED  (byte 57, 0xFF when no lanes seen,
+    non-0xFF when camera detects lane markings; bytes 58..63 then carry the
+    lane-model payload). Goes active briefly during engagement when lanes
+    are clear.
+  - ACC_TARGET_PRESENT_A/B = 0x34F.OBJ_A/B_PRESENT (byte 1 / byte 29; 0xFF
+    means no target, any other value means target tracked). Only active
+    during engagement AND when a lead is detected.
+  - 0x34F.OBJ_A/B_UNK_25_26/53_54: renamed from "DISTANCE" - while corr -0.99
+    with ego speed in ONE target-tracking window suggested distance, the same
+    bytes varied in the OLD (unengaged) session too. Meaning unclear.
+
+== GPS / location data: NOT on either captured bus ==
+Searched thoroughly for lat/lon signatures (smooth 16/32-bit bidirectional
+fields proportional to speed) with negative result. The R5 likely carries
+GPS on its telematics/infotainment bus (not captured here) or via UDS
+diagnostics on demand (GDPR-driven). To obtain GPS:
+  - Hook red-panda to the telematics CAN (OCU/TBU module - separate from
+    the ADAS/chassis buses captured here)
+  - Or query UDS service 0x22 ReadDataByIdentifier with proprietary DIDs
+
+== Time/frame counters found (not GPS, but useful) ==
+  - Object-cluster messages (0x302, 0x311, ... 0x3DF, 0x34B, etc.) all carry
+    a 16-bit time counter at bytes 25-26 and byte 53-54 (mirrored on obj B),
+    ticking at ~4.3 Hz regardless of motion. Per-frame monotonic; useful for
+    deterministic sequencing of ADAS object data.
+
+Note on false-positive "odometers": 0x496/0x517/0x4D1/0x4B3 were initially
+flagged as motion-dependent accumulators because their 32-bit windows showed
+large monotonic growth with rate~0 when stopped. On inspection that growth
+came entirely from the ECU initialization transition (bytes all-zero before
+handshake, settling to meaningful content after a few seconds) - NOT a real
+accumulator. These are status/reference messages, not odometers.
+
+CONFIRMED - LKA CMD = 0x134 (validated against 1400+ seconds of engagement
+across 3 heavily-engaged drives 2026-04-21):
+  byte 10 is nonzero ONLY during engagement (0% of unengaged frames vs 3-5%
+  of engaged frames). Matches GWM's BO_ 299 STEER_CMD pattern: small scalar
+  cmd + large BYPASS_ME MAC. During sustained straight cruise the cmd is
+  ~0; it activates briefly to correct lane drift.
+    - byte 10 = 8-bit TORQUE_CMD (zero at idle, nonzero during corrections)
+    - bytes 16-17 = 16-bit BYPASSME_SECOC_MAC (76-pair rolling code)
+    - byte 17 high nibble = 4-bit COUNTER (SecOC sequence counter)
+  Note: 0x134 does NOT follow the standard Renault CRC-at-byte-4 /
+  COUNTER-at-byte-5-high convention. Bytes 0-9 and 11-15 are constant -
+  the ONLY active payload is byte 10 (cmd) and bytes 16-17 (MAC).
+
+CONFIRMED - ACC SET_SPEED at 0x5EF bytes 3 and 4 (8-bit, km/h):
+  Held value 48 during a 47 km/h cruise (2026-04-21--11-46-06 drive); 0 when
+  disengaged. Redundant copy at 0x3E6 byte 6. Both are 8-bit unsigned km/h.
+
+STATIONARY CAPTURE (2026-04-22, ~22 min) added the following insights:
+  - 0x4B4 byte 3 bit 7 = HEARTBEAT (rapid flip-flop); low 7 bits = real state.
+  - 0x588 byte 8 bit 2 is a composite door/warning bit (40% on during Phase-1
+    door test, 3.6% during driving). Currently labelled
+    DOOR_DRIVER_OPEN_CANDIDATE pending a dedicated per-door test.
+  - 0x588 byte 19 bit 1 is the best R-blinker echo candidate (corr +0.38 with
+    0x58B.TURN_SIGNAL_RIGHT; 0.04% stationary vs 1.6% driving).
+  - LEFT blinker at 0x112.byte14.bit0: validated in 2026-04-21--11-27-00 drive
+    (the 2026-04-22 stationary capture didn't trigger LEFT - driver forgot).
+  - 0x588 body message has rich byte-level activity 0-200s (Phase 1 doors /
+    Phase 2 belts period) but no single bit cleanly maps to per-door state
+    from the capture alone - too many co-activating bits. Likely door/belt
+    info is encoded as a packed status bitfield, not per-feature bits.
+  - PHASE 6 (cruise buttons t=256-472s): placed 4 button bits in 0x4D1 bytes
+    5-6 (BUTTON_A_RES/B_SPEED/C_SET/D_CANCEL); FOLLOW_DISTANCE 2-bit enum
+    found at 0x4D1 byte 3 bits 3-4 (Nissan ProPilot pattern match).
+  - PHASE 5 (gear cycle t=1253-1295s): yielded GEAR_DIRECTION (0x44C, 2-bit),
+    REVERSE_LIGHT (0x453), GEAR_SELECTED (0x224), FORWARD_GEAR_ACTIVE (0x112).
+
+MISSING / NOT CONFIRMED (confirmed via 26-session / 19M-frame multi-session sweep):
+  - YAW_RATE / LAT_ACCEL: still no clean IMU signal. 0x22A has 4 SPEED_LIKE_*
+    fields (corr 0.58-0.72 with speed) but nothing yaw-rate-like
+    (r ~ v*steer/wheelbase). A 16-bit signed scan against (speed * d(steer)/dt)
+    across all driving sessions produced NO candidate with |corr| > 0.5.
+    Likely on ESP/ABS-specific internal bus not captured by the panda.
+  - HANDS_ON_WHEEL 1-bit indicator: best R5 candidates correlate only
+    0.47-0.55 with |DRIVER_TORQUE|>200. Software must threshold DRIVER_TORQUE.
+  - STEER_RATE direction: 0x112 byte 8 is magnitude only. Use 0x1AB.STEER_RATE
+    (16-bit signed, scale 0.01 deg/s) for the signed version.
+  - Individual doors/belts: 0x588 STATUS bits have composite activity; per-door
+    bits not isolable from current captures. Needs dedicated door-by-door
+    capture with ≥5s gaps.
+  - Battery SOC / 12V voltage / odometer: searched for monotonic growth/decay
+    within the longest drive (10 min highway) and across all sessions - no
+    clean candidate on the captured buses. Likely on battery/telematics bus.
+  - GPS: confirmed NOT on either captured bus.
+  - 0x226.VEHICLE_SPEED_A/B are misnamed: raw values reach 29.2 when stopped
+    and 60-62 when actual speed is 40 kph (1.5x ratio). Interpretation
+    unclear; renamed to UNK_SPEED_LIKE pending cleaner correlation study.
+
+== Undecoded active addresses (seen in 18-20 of 26 sessions) ==
+The following 80+ addresses are active on bus 0/1 in nearly every session but
+not yet decoded. Most are likely battery BMS (0x5xx cluster), TPMS/diagnostic
+(0x6xx cluster), HVAC/infotainment, or redundant status messages that aren't
+critical for openpilot lateral control:
+  0x192, 0x22B, 0x22C, 0x22D, 0x22E, 0x231, 0x25E, 0x2BA, 0x300, 0x301,
+  0x3E1, 0x3EA, 0x422, 0x450, 0x451, 0x490, 0x496, 0x499, 0x4B3, 0x4C5,
+  0x4CF, 0x4D2, 0x4EE, 0x4FE, 0x517, 0x528, 0x52B, 0x52C, 0x52D, 0x53B,
+  0x53C, 0x541, 0x54C, 0x551, 0x559, 0x562, 0x565, 0x57A, 0x585, 0x587,
+  0x593, 0x5A8, 0x5BA, 0x5D1, 0x5DD, 0x5DE, 0x5E6, 0x5EE, 0x611, 0x615,
+  0x616, 0x62B, 0x631, 0x665, 0x67A, 0x691, 0x692, 0x6AD, + misc 6xx range.
+Extended 29-bit IDs 0x1BDE62F2, 0x1BDEF262 appeared in 2 sessions (likely
+FOB or UDS diagnostic responses).
+0x422 and 0x496 have CRC+COUNTER+SecOC-MAC-like structure; 0x300 broadcasts
+static calibration data (first and last frame identical across 113k frames).
+
+== Non-scalar fields (do NOT treat as signals) ==
+  - 0x134.BYPASSME_SECOC_MAC (bytes 16-17): 76-pair rolling code, likely a
+    SecOC MAC wrapping the LKA torque command (see BO_ 308 LKA_CMD_134).
+    Pattern mirrors GWM Haval H6 STEER_CMD and AUTOSAR SecOC spec.
+  - 0x112.BYPASSME_TAIL_*: 80 bits of full-entropy payload at end of frame.
+  - 0x355: 58 of 64 bytes are full-entropy; likely CRC-protected proprietary
+    camera/radar telemetry.
+  - 0x22A has ~16 signed 16-bit fields that go from 'pinned-at-fixed-value'
+    when disengaged to 'full signed range' during engagement. Mixture of real
+    ADAS data and rolling crypto tokens; NOT a clean cmd channel.";
+
+
+BO_ 32 UNK_020: 24 XXX
+ SG_ COUNTER : 39|2@0+ (1,0) [0|3] "" XXX
+
+BO_ 114 UNK_072: 7 XXX
+ SG_ CHECKSUM : 39|8@0+ (1,0) [0|255] "" XXX
+
+BO_ 120 CHASSIS_078: 24 XXX
+ SG_ UNK_BYTE4 : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ UNK_BYTE5 : 47|8@0+ (1,0) [0|255] "" XXX
+ SG_ UNK_BYTE6 : 55|8@0+ (1,0) [0|255] "" XXX
+ SG_ UNK_BYTE7 : 63|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER : 71|4@0+ (1,0) [0|15] "" XXX
+ SG_ UNK_BYTE8_LO : 67|4@0+ (1,0) [0|15] "" XXX
+ SG_ UNK_BYTE9 : 79|8@0+ (1,0) [0|255] "" XXX
+ SG_ UNK_BYTE10 : 87|4@0+ (1,0) [0|15] "" XXX
+ SG_ BYPASSME_14_23 : 119|80@0+ (1,0) [0|0] "" XXX
+
+BO_ 136 ACCEL_088: 8 XXX
+ SG_ ACCEL_LIKE : 47|16@0+ (0.02,-213.5) [-10|10] "m/s^2" XXX
+ SG_ UNK_BYTE7 : 63|4@0+ (1,0) [0|15] "" XXX
+
+BO_ 140 ACC_PEDAL_8C: 12 XXX
+ SG_ CHECKSUM : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER : 47|4@0+ (1,0) [0|15] "" XXX
+ SG_ ACCEL_PEDAL : 55|16@0+ (0.001525902,0) [0|100] "%" XXX
+ SG_ STEER_ANGLE_REQ : 87|16@0+ (0.0986,-1527) [-1500|4900] "deg" XXX
+
+BO_ 274 STEERING_SENSOR_112: 64 XXX
+ SG_ CHECKSUM_1 : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER_1 : 47|4@0+ (1,0) [0|15] "" XXX
+ SG_ BRAKE_LIGHT : 56|1@0+ (1,0) [0|1] "" XXX
+ SG_ BRAKE_PRESSED : 57|1@0+ (1,0) [0|1] "" XXX
+ SG_ STEER_RATE : 71|8@0+ (1,0) [0|255] "deg/s" XXX
+ SG_ CHECKSUM_2 : 111|8@0+ (1,0) [0|255] "" XXX
+ SG_ TURN_SIGNAL_LEFT : 112|1@0+ (1,0) [0|1] "" XXX
+ SG_ COUNTER_2 : 119|4@0+ (1,0) [0|15] "" XXX
+ SG_ STEER_ANGLE_1 : 127|11@0+ (0.2,-204.8) [-204.8|204.6] "deg" XXX
+ SG_ FORWARD_GEAR_ACTIVE : 147|1@0+ (1,0) [0|1] "" XXX
+ SG_ CHECKSUM_3 : 191|8@0+ (1,0) [0|255] "" XXX
+ SG_ TURN_SIGNAL_LEFT_DUP : 192|1@0+ (1,0) [0|1] "" XXX
+ SG_ COUNTER_3 : 199|4@0+ (1,0) [0|15] "" XXX
+ SG_ STEER_ANGLE_2 : 207|11@0+ (0.2,-204.8) [-204.8|204.6] "deg" XXX
+ SG_ CHECKSUM_4 : 271|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER_4 : 279|4@0+ (1,0) [0|15] "" XXX
+ SG_ LONG_ACCEL : 291|10@0+ (0.02,-12.32) [-12.32|8.14] "m/s^2" XXX
+ SG_ BYPASSME_TAIL_HI : 439|32@0+ (1,0) [0|4294967295] "" XXX
+ SG_ BYPASSME_TAIL_LO : 471|32@0+ (1,0) [0|4294967295] "" XXX
+
+BO_ 303 GEAR_12F: 12 XXX
+ SG_ CHECKSUM : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER : 47|4@0+ (1,0) [0|15] "" XXX
+ SG_ GEAR_STATE : 52|4@0+ (1,0) [0|15] "" XXX
+ SG_ GEAR_ENGAGED : 53|1@0+ (1,0) [0|1] "" XXX
+ SG_ PARK_ACTIVE : 55|1@0+ (1,0) [0|1] "" XXX
+
+BO_ 308 LKA_CMD_134: 24 XXX
+ SG_ UNK_BYTE9 : 71|2@0+ (1,0) [0|3] "" XXX
+ SG_ TORQUE_CMD : 87|8@0+ (1,0) [0|255] "" XXX
+ SG_ BYPASSME_SECOC_MAC : 135|16@0+ (1,0) [0|65535] "" XXX
+ SG_ COUNTER : 143|4@0+ (1,0) [0|15] "" XXX
+
+BO_ 380 EPS_17C: 12 XXX
+ SG_ CHECKSUM : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER : 47|4@0+ (1,0) [0|15] "" XXX
+ SG_ EPS_MOTOR_POS : 53|14@0+ (1,0) [0|16383] "" XXX
+ SG_ DRIVER_TORQUE : 79|16@0+ (1,-32768) [-32768|32767] "" XXX
+
+BO_ 403 UNK_193: 16 XXX
+ SG_ CHECKSUM : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER : 47|4@0+ (1,0) [0|15] "" XXX
+ SG_ BYPASSME_6_15 : 55|80@0+ (1,0) [0|0] "" XXX
+
+BO_ 427 STEERING_CTRL_1AB: 48 XXX
+ SG_ CHECKSUM_A : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER_A : 47|4@0+ (1,0) [0|15] "" XXX
+ SG_ LKAS_TORQUE_CMD : 63|8@0+ (1,-150) [-150|105] "" XXX
+ SG_ LKAS_STATE : 74|2@0+ (1,0) [0|3] "" XXX
+ SG_ CHECKSUM_B : 119|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER_B : 127|4@0+ (1,0) [0|15] "" XXX
+ SG_ STEER_ANGLE : 135|16@0+ (0.1,-3276.8) [-3276.8|3276.7] "deg" XXX
+ SG_ STEER_TURN_CNT : 151|16@0+ (1,0) [0|65535] "" XXX
+ SG_ STEER_RATE : 167|16@0+ (0.01,-327.68) [-327.68|327.67] "deg/s" XXX
+ SG_ CHECKSUM_C : 215|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER_C : 223|4@0+ (1,0) [0|15] "" XXX
+ SG_ LKAS_UNK_27_28 : 219|12@0+ (1,0) [0|4095] "" XXX
+ SG_ UNK_C_BYTE30_31 : 247|16@0+ (1,0) [0|65535] "" XXX
+ SG_ UNK_C_BYTE32_33 : 263|11@0+ (1,0) [0|2047] "" XXX
+
+BO_ 540 UNK_21C: 20 XXX
+ SG_ CHECKSUM : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER : 47|4@0+ (1,0) [0|15] "" XXX
+ SG_ BYPASSME_10_19 : 87|80@0+ (1,0) [0|0] "" XXX
+
+BO_ 548 PEDAL_AND_GEAR_224: 7 XXX
+ SG_ GEAR_SELECTED : 3|1@0+ (1,0) [0|1] "" XXX
+ SG_ BRAKE_PRESSURE : 15|8@0+ (1,0) [0|255] "" XXX
+ SG_ DIRECTION_HI : 23|8@0+ (1,0) [0|255] "" XXX
+ SG_ DIRECTION_LO : 31|8@0+ (1,0) [0|255] "" XXX
+
+BO_ 550 WHEEL_SPEEDS_226: 48 XXX
+ SG_ CHECKSUM_A : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER_A : 47|4@0+ (1,0) [0|15] "" XXX
+ SG_ WHEEL_SPEED_FL : 55|16@0+ (0.005,0) [0|320] "km/h" XXX
+ SG_ WHEEL_SPEED_FR : 71|16@0+ (0.005,0) [0|320] "km/h" XXX
+ SG_ UNK_SPEED_LIKE_A : 87|16@0+ (1,0) [0|65535] "" XXX
+ SG_ CHECKSUM_B : 191|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER_B_LO : 179|4@0+ (1,0) [0|15] "" XXX
+ SG_ UNK_B_BYTE16 : 135|7@0+ (1,0) [0|127] "" XXX
+ SG_ UNK_B_BYTE17 : 143|7@0+ (1,0) [0|127] "" XXX
+ SG_ UNK_B_BYTE18 : 151|7@0+ (1,0) [0|127] "" XXX
+ SG_ UNK_B_BYTE19 : 159|7@0+ (1,0) [0|127] "" XXX
+ SG_ UNK_B_BYTE20 : 167|8@0+ (1,0) [0|255] "" XXX
+ SG_ CHECKSUM_C : 287|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER_C_LO : 275|4@0+ (1,0) [0|15] "" XXX
+ SG_ WHEEL_SPEED_RL : 231|16@0+ (0.005,0) [0|320] "km/h" XXX
+ SG_ WHEEL_SPEED_RR : 247|16@0+ (0.005,0) [0|320] "km/h" XXX
+ SG_ UNK_SPEED_LIKE_B : 263|16@0+ (1,0) [0|65535] "" XXX
+
+BO_ 554 DYNAMICS_22A: 64 XXX
+ SG_ SPEED_LIKE_B12_13 : 103|16@0+ (1,0) [0|65535] "" XXX
+ SG_ SPEED_LIKE_B14_15 : 119|16@0+ (1,0) [0|65535] "" XXX
+ SG_ SPEED_LIKE_B34_35 : 279|16@0+ (1,0) [0|65535] "" XXX
+ SG_ SPEED_LIKE_B38_39 : 311|16@0+ (1,0) [0|65535] "" XXX
+ SG_ EVENT_BYTE40_BIT1 : 321|1@0+ (1,0) [0|1] "" XXX
+ SG_ STATE_BYTE56_LO6 : 453|6@0+ (1,0) [0|63] "" XXX
+ SG_ STATE_BYTE60_LO6 : 485|6@0+ (1,0) [0|63] "" XXX
+
+BO_ 557 UNK_22D: 64 XXX
+ SG_ UNK_BYTE21 : 175|8@0+ (1,0) [0|255] "" XXX
+ SG_ UNK_BYTE42 : 343|8@0+ (1,0) [0|255] "" XXX
+ SG_ UNK_BYTE43_44 : 351|16@0+ (1,0) [0|65535] "" XXX
+
+BO_ 600 UNK_25F: 20 XXX
+ SG_ CHECKSUM : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER : 47|4@0+ (1,0) [0|15] "" XXX
+ SG_ BYPASSME_11_19 : 95|72@0+ (1,0) [0|0] "" XXX
+
+BO_ 604 UNK_25C: 4 XXX
+ SG_ COUNTER : 15|4@0+ (1,0) [0|15] "" XXX
+ SG_ DATA_A : 7|8@0+ (1,0) [0|255] "" XXX
+
+BO_ 664 UNK_298: 20 XXX
+ SG_ CHECKSUM : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER : 47|4@0+ (1,0) [0|15] "" XXX
+ SG_ BYPASSME_10_19 : 87|80@0+ (1,0) [0|0] "" XXX
+
+BO_ 770 ADAS_OBJ_302: 64 XXX
+ SG_ OBJ_A_BYTE0 : 5|6@0+ (1,0) [0|63] "" XXX
+ SG_ OBJ_A_BYTE5_6 : 47|16@0+ (1,0) [0|65535] "" XXX
+ SG_ OBJ_A_BYTE8 : 71|7@0+ (1,0) [0|127] "" XXX
+ SG_ OBJ_A_BYTE9_10 : 78|14@0+ (1,0) [0|16383] "" XXX
+ SG_ OBJ_A_BYTE11_12 : 95|13@0+ (1,0) [0|8191] "" XXX
+ SG_ OBJ_A_BYTE13 : 106|10@0+ (1,0) [0|1023] "" XXX
+ SG_ OBJ_A_BYTE15 : 122|10@0+ (1,0) [0|1023] "" XXX
+ SG_ OBJ_A_BYTE17 : 138|7@0+ (1,0) [0|127] "" XXX
+ SG_ OBJ_A_BYTE20 : 162|7@0+ (1,0) [0|127] "" XXX
+ SG_ OBJ_A_BYTE22 : 176|8@0+ (1,0) [0|255] "" XXX
+ SG_ OBJ_A_BYTE25 : 204|5@0+ (1,0) [0|31] "" XXX
+ SG_ OBJ_A_BYTE26_27 : 214|15@0+ (1,0) [0|32767] "" XXX
+ SG_ OBJ_B_BYTE32 : 247|16@0+ (1,0) [0|65535] "" XXX
+ SG_ OBJ_B_BYTE34_35 : 271|16@0+ (1,0) [0|65535] "" XXX
+ SG_ OBJ_B_BYTE36 : 295|7@0+ (1,0) [0|127] "" XXX
+ SG_ OBJ_B_BYTE37 : 297|2@0+ (1,0) [0|3] "" XXX
+ SG_ OBJ_B_BYTE37_2 : 302|7@0+ (1,0) [0|127] "" XXX
+ SG_ OBJ_B_BYTE38_39 : 311|12@0+ (1,0) [0|4095] "" XXX
+ SG_ OBJ_B_BYTE39 : 314|8@0+ (1,0) [0|255] "" XXX
+ SG_ OBJ_B_BYTE41 : 330|10@0+ (1,0) [0|1023] "" XXX
+ SG_ OBJ_B_BYTE43 : 346|10@0+ (1,0) [0|1023] "" XXX
+ SG_ OBJ_B_BYTE45 : 362|7@0+ (1,0) [0|127] "" XXX
+ SG_ OBJ_B_BYTE58_59 : 471|16@0+ (1,0) [0|65535] "" XXX
+
+BO_ 785 ADAS_OBJ_311: 64 XXX
+ SG_ OBJ_A_BYTE1 : 15|9@0+ (1,0) [0|511] "" XXX
+ SG_ OBJ_A_BYTE2 : 21|6@0+ (1,0) [0|63] "" XXX
+ SG_ OBJ_A_BYTE4 : 39|7@0+ (1,0) [0|127] "" XXX
+ SG_ OBJ_A_BYTE5 : 46|7@0+ (1,0) [0|127] "" XXX
+ SG_ OBJ_A_BYTE6 : 55|7@0+ (1,0) [0|127] "" XXX
+ SG_ OBJ_A_BYTE7_8 : 63|13@0+ (1,0) [0|8191] "" XXX
+ SG_ OBJ_A_BYTE9 : 74|10@0+ (1,0) [0|1023] "" XXX
+ SG_ OBJ_A_BYTE11 : 90|10@0+ (1,0) [0|1023] "" XXX
+ SG_ OBJ_A_BYTE13 : 108|9@0+ (1,0) [0|511] "" XXX
+ SG_ OBJ_A_BYTE16 : 130|7@0+ (1,0) [0|127] "" XXX
+ SG_ OBJ_A_BYTE18 : 145|9@0+ (1,0) [0|511] "" XXX
+ SG_ OBJ_A_BYTE20 : 165|3@0+ (1,0) [0|7] "" XXX
+ SG_ OBJ_A_BYTE26_27 : 212|13@0+ (1,0) [0|8191] "" XXX
+ SG_ OBJ_A_BYTE29 : 235|4@0+ (1,0) [0|15] "" XXX
+ SG_ OBJ_B_BYTE32 : 260|1@0+ (1,0) [0|1] "" XXX
+ SG_ OBJ_B_BYTE35 : 282|8@0+ (1,0) [0|255] "" XXX
+ SG_ OBJ_B_BYTE37 : 298|10@0+ (1,0) [0|1023] "" XXX
+ SG_ OBJ_B_BYTE39 : 314|10@0+ (1,0) [0|1023] "" XXX
+ SG_ OBJ_B_BYTE41 : 330|7@0+ (1,0) [0|127] "" XXX
+ SG_ OBJ_B_BYTE54_55 : 436|13@0+ (1,0) [0|8191] "" XXX
+
+BO_ 788 ADAS_OBJ_314: 64 XXX
+ SG_ OBJ_A_BYTE1 : 15|7@0+ (1,0) [0|127] "" XXX
+ SG_ OBJ_A_BYTE2 : 23|7@0+ (1,0) [0|127] "" XXX
+ SG_ OBJ_A_BYTE4 : 38|6@0+ (1,0) [0|63] "" XXX
+ SG_ OBJ_A_BYTE5 : 42|10@0+ (1,0) [0|1023] "" XXX
+ SG_ OBJ_A_BYTE7_8 : 63|13@0+ (1,0) [0|8191] "" XXX
+ SG_ OBJ_A_BYTE9 : 74|10@0+ (1,0) [0|1023] "" XXX
+ SG_ OBJ_A_BYTE11 : 90|10@0+ (1,0) [0|1023] "" XXX
+ SG_ OBJ_A_BYTE13 : 106|7@0+ (1,0) [0|127] "" XXX
+ SG_ LANE_DETECTED : 463|8@0+ (1,0) [0|255] "" XXX
+ SG_ LANE_MODEL_58_63 : 471|48@0+ (1,0) [0|0] "" XXX
+
+BO_ 821 ADAS_OBJ_335: 64 XXX
+ SG_ OBJ_BYTE4 : 39|7@0+ (1,0) [0|127] "" XXX
+ SG_ OBJ_BYTE11 : 90|10@0+ (1,0) [0|1023] "" XXX
+ SG_ OBJ_BYTE13 : 106|7@0+ (1,0) [0|127] "" XXX
+
+BO_ 843 ADAS_OBJ_34B: 64 XXX
+ SG_ OBJ_A_VALID_OR_MOVING : 202|1@0+ (1,0) [0|1] "" XXX
+ SG_ OBJ_B_VALID_OR_MOVING : 426|1@0+ (1,0) [0|1] "" XXX
+ SG_ OBJ_TAIL : 439|16@0+ (1,0) [0|65535] "" XXX
+
+BO_ 847 ACC_TARGET_34F: 64 XXX
+ SG_ OBJ_A_PRESENT : 15|8@0+ (1,0) [0|255] "" XXX
+ SG_ OBJ_A_UNK_25_26 : 207|16@0+ (1,0) [0|65535] "" XXX
+ SG_ OBJ_B_PRESENT : 239|8@0+ (1,0) [0|255] "" XXX
+ SG_ OBJ_B_UNK_53_54 : 431|16@0+ (1,0) [0|65535] "" XXX
+
+BO_ 853 OPAQUE_355: 64 XXX
+ SG_ HEADER_1 : 13|3@0+ (1,0) [0|7] "" XXX
+ SG_ HEADER_2 : 19|5@0+ (1,0) [0|31] "" XXX
+ SG_ HEADER_3 : 29|1@0+ (1,0) [0|1] "" XXX
+
+BO_ 998 ACC_SETPOINT_3E6: 20 XXX
+ SG_ CHECKSUM : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER : 47|4@0+ (1,0) [0|15] "" XXX
+ SG_ SET_SPEED : 55|8@0+ (1,0) [0|255] "km/h" XXX
+
+BO_ 1018 VEHICLE_SPEED_3FA: 48 XXX
+ SG_ VEHICLE_SPEED_KPH : 39|8@0+ (1,0) [0|255] "km/h" XXX
+ SG_ COUNTER : 47|4@0+ (1,0) [0|15] "" XXX
+ SG_ VEHICLE_SPEED_HIGH_RES : 52|13@0+ (0.00616,0) [0|50] "km/h" XXX
+ SG_ ACCEL_PEDAL_LOW_RATE : 167|8@0+ (0.5,-18.5) [-18.5|109] "%" XXX
+
+BO_ 1081 UNK_439: 7 XXX
+ SG_ UNK_BYTE0 : 6|7@0+ (1,0) [0|127] "" XXX
+ SG_ UNK_BYTE3 : 28|5@0+ (1,0) [0|31] "" XXX
+ SG_ UNK_BYTE4 : 39|4@0+ (1,0) [0|15] "" XXX
+ SG_ UNK_BYTE5 : 42|3@0+ (1,0) [0|7] "" XXX
+
+BO_ 1100 GEAR_DIRECTION_44C: 12 XXX
+ SG_ CHECKSUM : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER : 47|4@0+ (1,0) [0|15] "" XXX
+ SG_ GEAR_DIRECTION : 70|2@0+ (1,0) [0|3] "" XXX
+
+BO_ 1107 GEAR_INDICATORS_453: 12 XXX
+ SG_ CHECKSUM : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER : 47|4@0+ (1,0) [0|15] "" XXX
+ SG_ REVERSE_LIGHT : 43|1@0+ (1,0) [0|1] "" XXX
+
+BO_ 1109 UNK_455: 24 XXX
+ SG_ CHECKSUM : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER : 47|4@0+ (1,0) [0|15] "" XXX
+ SG_ BYPASSME_14_23 : 119|80@0+ (1,0) [0|0] "" XXX
+
+BO_ 1203 UNK_4B3: 5 XXX
+ SG_ UNK_STATE : 7|8@0+ (1,0) [0|255] "" XXX
+
+BO_ 1204 EPS_STATE_4B4: 8 XXX
+ SG_ EPS_STATE_HEARTBEAT : 31|1@0+ (1,0) [0|1] "" XXX
+ SG_ EPS_STATE : 30|7@0+ (1,0) [0|127] "" XXX
+
+BO_ 1205 EPS_STATE_4B5: 8 XXX
+ SG_ ADAS_ENGAGED : 7|8@0+ (1,0) [0|255] "" XXX
+
+BO_ 1233 CRUISE_BUTTONS_4D1: 8 XXX
+ SG_ BUTTON_C_SET : 45|1@0+ (1,0) [0|1] "" XXX
+ SG_ BUTTON_B_SPEED : 54|1@0+ (1,0) [0|1] "" XXX
+ SG_ BUTTON_A_RES : 55|1@0+ (1,0) [0|1] "" XXX
+ SG_ BUTTON_D_CANCEL : 53|1@0+ (1,0) [0|1] "" XXX
+ SG_ FOLLOW_DISTANCE : 28|2@0+ (1,0) [0|3] "" XXX
+
+BO_ 1303 UNK_517: 8 XXX
+ SG_ UNK_STATE_BIT : 48|1@0+ (1,0) [0|1] "" XXX
+ SG_ UNK_BYTE2 : 23|8@0+ (1,0) [0|255] "" XXX
+
+BO_ 1310 UNK_51E: 8 XXX
+ SG_ UNK_BYTE1 : 15|8@0+ (1,0) [0|255] "" XXX
+
+BO_ 1332 BODY_534: 24 XXX
+ SG_ CHECKSUM : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER : 47|4@0+ (1,0) [0|15] "" XXX
+ SG_ FIXED_HEADER_BYTE6 : 55|8@0+ (1,0) [0|255] "" XXX
+ SG_ FIXED_HEADER_BYTE7 : 63|8@0+ (1,0) [0|255] "" XXX
+
+BO_ 1378 UNK_562: 8 XXX
+ SG_ DATA_VALID : 60|1@0+ (1,0) [0|1] "" XXX
+ SG_ UNK_BYTE1 : 15|8@0+ (1,0) [0|255] "" XXX
+ SG_ UNK_BYTE2_LO : 19|4@0+ (1,0) [0|15] "" XXX
+ SG_ UNK_BYTE4 : 39|8@0+ (1,0) [0|255] "" XXX
+
+BO_ 1381 UNK_565: 6 XXX
+ SG_ UNK_BYTE0 : 7|8@0+ (1,0) [0|255] "" XXX
+ SG_ UNK_BYTE2 : 23|8@0+ (1,0) [0|255] "" XXX
+ SG_ UNK_BYTE4 : 39|8@0+ (1,0) [0|255] "" XXX
+
+BO_ 1416 BELTS_DOORS_588: 24 XXX
+ SG_ CHECKSUM_A : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER_A : 47|4@0+ (1,0) [0|15] "" XXX
+ SG_ TURN_SIGNAL_RIGHT_ECHO : 153|1@0+ (1,0) [0|1] "" XXX
+ SG_ STATUS_A_BYTE6 : 55|8@0+ (1,0) [0|255] "" XXX
+ SG_ STATUS_A_BYTE7 : 63|8@0+ (1,0) [0|255] "" XXX
+ SG_ DOOR_DRIVER_OPEN_CANDIDATE : 66|1@0+ (1,0) [0|1] "" XXX
+ SG_ STATUS_A_BYTE9 : 79|8@0+ (1,0) [0|255] "" XXX
+ SG_ BELT_UNBUCKLED_CANDIDATE : 87|1@0+ (1,0) [0|1] "" XXX
+ SG_ STATUS_A_BYTE11 : 95|8@0+ (1,0) [0|255] "" XXX
+ SG_ CHECKSUM_B : 135|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER_B : 143|4@0+ (1,0) [0|15] "" XXX
+ SG_ STATUS_B_BYTE18 : 151|8@0+ (1,0) [0|255] "" XXX
+ SG_ STATUS_B_BYTE19 : 159|8@0+ (1,0) [0|255] "" XXX
+ SG_ STATUS_B_BYTE20 : 167|8@0+ (1,0) [0|255] "" XXX
+ SG_ STATUS_B_BYTE21 : 175|8@0+ (1,0) [0|255] "" XXX
+ SG_ STATUS_B_BYTE22 : 183|8@0+ (1,0) [0|255] "" XXX
+ SG_ STATUS_B_BYTE23 : 191|8@0+ (1,0) [0|255] "" XXX
+
+BO_ 1419 TURN_SIGNAL_RIGHT_58B: 12 XXX
+ SG_ TURN_SIGNAL_RIGHT : 89|1@0+ (1,0) [0|1] "" XXX
+ SG_ TURN_SIGNAL_BYTE11 : 95|8@0+ (1,0) [0|255] "" XXX
+
+BO_ 1487 UNK_5CF: 12 XXX
+ SG_ CHECKSUM : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER : 47|4@0+ (1,0) [0|15] "" XXX
+
+BO_ 1508 UNK_5E4: 24 XXX
+ SG_ CHECKSUM : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ COUNTER : 47|4@0+ (1,0) [0|15] "" XXX
+ SG_ BYPASSME_14_23 : 119|80@0+ (1,0) [0|0] "" XXX
+
+BO_ 1519 ACC_SETPOINT_5EF: 8 XXX
+ SG_ SET_SPEED : 31|8@0+ (1,0) [0|255] "km/h" XXX
+ SG_ SET_SPEED_DUP : 39|8@0+ (1,0) [0|255] "km/h" XXX
+
+BO_ 1541 WINDOWS_605: 20 XXX
+ SG_ WINDOW_BUTTON_PRESSED : 23|1@0+ (1,0) [0|1] "" XXX
+ SG_ UNK_BYTE6 : 50|3@0+ (1,0) [0|7] "" XXX
+ SG_ UNK_BYTE13 : 108|1@0+ (1,0) [0|1] "" XXX
+ SG_ UNK_BYTE16 : 135|8@0+ (1,0) [0|255] "" XXX
+
+BO_ 1638 BODY_666: 24 XXX
+ SG_ BRAKE_PRESSED_LOW_RATE : 43|1@0+ (1,0) [0|1] "" XXX
+ SG_ UNK_BYTE5_LO : 42|3@0+ (1,0) [0|7] "" XXX
+ SG_ UNK_BYTE6 : 52|5@0+ (1,0) [0|31] "" XXX
+ SG_ UNK_BYTE9 : 79|10@0+ (1,0) [0|1023] "" XXX
+ SG_ UNK_BYTE10 : 83|4@0+ (1,0) [0|15] "" XXX
+ SG_ UNK_BYTE11 : 95|7@0+ (1,0) [0|127] "" XXX
+
+BO_ 1645 UNK_66D: 24 XXX
+ SG_ BYPASSME_14_23 : 119|80@0+ (1,0) [0|0] "" XXX
+
+BO_ 1661 MOTOR_RPM_67D: 8 XXX
+ SG_ MOTOR_RPM : 3|12@0+ (1,0) [0|4095] "rpm" XXX
+
+BO_ 1686 UNK_696: 6 XXX
+ SG_ UNK_BYTE1 : 13|6@0+ (1,0) [0|63] "" XXX
+ SG_ UNK_BYTE3 : 29|6@0+ (1,0) [0|63] "" XXX
+
+CM_ BO_ 114 "0x072 - high-rate (100Hz) 7-byte message on bus 1. Non-standard counter position (not at byte 5 high). Unknown purpose.";
+CM_ BO_ 120 "0x078 - chassis/body high-rate message on bus 1 (100Hz, 24B). Previously suspected to contain a turn signal bit (byte 4 bit 7) based on 2 brief ON episodes; redacted after proper 2-bit field search found the real turn signal on 0x58B instead. Byte 4 bit 7 is likely a different event flag. Counter at byte 8 HIGH nibble (not byte 5).";
+CM_ BO_ 136 "0x088 - 100Hz 8B on bus 1. ACCEL_LIKE field (bytes 5-6) correlates +0.87 with longitudinal accel proxy. Scale 0.02 m/s^2 with offset -213.5 is a rough calibration based on session variance; re-calibrate against a known brake-to-stop event.";
+CM_ BO_ 140 "0x08C - accelerator pedal @100Hz on bus 0. ACCEL_PEDAL is a 16-bit fraction scaled 100/65535 so 0..100% (observed max 96%). STEER_ANGLE_REQ (bytes 10-11) correlates +0.87 with 0x1AB.STEER_ANGLE via linear fit raw=10.14*steer+15487 (scale ~0.0986 deg/count). Residual std 53 deg suggests this is NOT a simple redundant angle readout - likely a steering angle REQUEST or CMD broadcast by a planning ECU (could be the LKA target angle when ADAS is engaged, or a pre-computed trajectory).";
+CM_ BO_ 274 "0x112 - primary high-rate steering sensor on bus 1 (100Hz, 64B). Four independent 10-byte subframes each with CHECKSUM+COUNTER. STEER_ANGLE_1/_2 are 12-bit redundant readings centered at 2048 (offset -204.8, scale 0.1 deg). The former 'STEER_ANGLE_3' at bits 291|10 is actually LONG_ACCEL - correlation +0.94 with speed-derivative (longitudinal acceleration). BRAKE_PRESSED (byte 7 bit 1) and BRAKE_LIGHT (byte 7 bit 0) are the primary brake indicators at 100Hz (corr +0.77 and +0.41 with decel events). STEER_RATE is byte 8 alone (8 bits) - the previous 10-bit placement wrongly included the brake bits. Final 10 bytes (bytes 54..63) are full-entropy AUTOSAR SecOC or rolling session token.";
+CM_ BO_ 303 "0x12F GEAR - 50Hz 12B bus 0. All 5 gear states validated via the dedicated gear-test drive 2026-04-17--13-23-29 and the Phase-5 gear-cycle in 2026-04-22. VAL table complete: 1=R, 2=N, 3=B, 8=D. PARK_ACTIVE=1 and GEAR_ENGAGED=0 when in P.";
+CM_ BO_ 308 "0x134 - LKA CMD (validated 2026-04-21 across 1400+s of engagement). Byte 10 is TORQUE_CMD: always 0 unengaged, nonzero 3-5% of engaged frames during lane-drift corrections. Bytes 16-17 are a SecOC MAC (76-pair rolling code; NOT a control signal). Byte 17 high nibble is COUNTER - this is INTENTIONALLY within the MAC range (SecOC MAC is computed OVER the counter value). 0x134 does NOT follow the standard Renault CRC-at-byte-4 / counter-at-byte-5-high convention.";
+CM_ BO_ 380 "0x17C EPS / driver torque sensor. DRIVER_TORQUE is biased-unsigned 16-bit centered at 32768 (offset -32768 → zero-centered signed). Observed mean ~0, std 63, range -731..+479 in driving log. Variance HIGHEST when LKAS_STATE=SUPPRESSED_BY_DRIVER (std 711 - driver actively turning); NARROWEST when LKAS_STATE=UNAVAILABLE (std 92). Matches Nissan 0x185 STEER_TORQUE_DRIVER pattern. EPS_MOTOR_POS (14-bit) tracks steering but with different phase than 0x1AB.STEER_ANGLE - likely motor-side resolver reading, not wheel angle.";
+CM_ BO_ 403 "0x193 - 100Hz 16B on bus 1. Most bytes full-entropy, likely a continuous sensor stream. Has standard Renault counter at byte 5 high.";
+CM_ BO_ 427 "0x1AB STEERING_CTRL - 100Hz 48B, 3 subframes (CRC at bytes 4/14/26, XOR 0x6A/0x17/0xCC). Sub A: LKAS_TORQUE_CMD (byte 7, 8-bit signed with offset -150, validated centred at 0 during LKAS active, constant 150 when LKAS UNAVAILABLE) + LKAS_STATE (byte 9 bits 1-2, 2-bit enum: 1=active/ready, 2=suppressed-by-driver, 3=unavailable; mirrors GWM/Nissan LKAS_STATE pattern). Sub B: STEER_ANGLE (16-bit 0.1 deg; invalid marker 3276.7 when 0xFFFF), STEER_TURN_CNT (16-bit rotation counter), STEER_RATE (16-bit signed 0.01 deg/s). Sub C: LKAS_UNK_27_28 (12-bit field, constant 2047 when LKAS unavailable, narrow 2857-3373 when active - NOT torque; semantic unclear, possibly a curvature/gain value) + UNK_C_BYTE30_31, UNK_C_BYTE32_33.";
+CM_ BO_ 540 "0x21C - 50Hz 20B on bus 1. Candidate for redundant wheel-speed readout (same 20B/50Hz shape as 0x25F and 0x298).";
+CM_ BO_ 554 "0x22A - vehicle-dynamics broadcast, 25Hz on bus 1 (64B). NOT an IMU: no field correlates with yaw (v*steer) > 0.2. Has four SPEED_LIKE_* fields that correlate 0.58-0.72 with vehicle speed (probably filtered/odometry speeds at different resolutions). Several 2-event state bits (byte 40, 56, 60) flipped at a few points in the drive - likely ACC/HDC/ESP state indicators. No standard Renault counter position.";
+CM_ BO_ 600 "0x25F - 50Hz 20B on bus 1. Same layout as 0x21C and 0x298.";
+CM_ BO_ 664 "0x298 - 50Hz 20B on bus 1. Same layout as 0x21C and 0x25F.";
+CM_ BO_ 1310 "0x51E - 27Hz 8B on bus 1. Byte 1 has 187 unique values (high entropy).";
+CM_ BO_ 843 "0x34B - ADAS object message (64B, 15Hz on bus 0). OBJ_A_VALID_OR_MOVING (byte 25 bit 2) and OBJ_B_VALID_OR_MOVING (byte 53 bit 2) were initially mis-identified as engagement flags - they're on 88% in the unengaged session too and only toggle with car motion state, not ADAS mode. Use 0x4B5.ADAS_ENGAGED instead for real engagement detection. The same bit at this position in each object record appears across the whole object-cluster (0x302..0x3DF) - synchronized.";
+CM_ BO_ 847 "0x34F - ACC lead-vehicle target tracking. OBJ_A_PRESENT (byte 1) and OBJ_B_PRESENT (byte 29) take value 0xFF when no target and various low values when a target is tracked (the latter only happens during ADAS engagement). Two tracked objects per frame (bytes 0..27 and 28..55). OBJ_A_UNK_25_26 / OBJ_B_UNK_53_54 are strong candidates for target distance or relative position - during a 4s target-tracking window they correlated -0.99 with ego speed, BUT the same bytes also vary in the unengaged session so the interpretation is not yet confirmed.";
+CM_ BO_ 1204 "0x4B4 - EPS/ADAS state on bus 1 (25Hz 8B). REFINED from 2026-04-22 stationary capture: byte 3 bit 7 is a HEARTBEAT that flips between 0/1 rapidly (XY <-> XY+0x80 alternation). The low 7 bits (EPS_STATE) encode the real state. During the stationary session observed 125+ unique values - a complex multi-state enum encoding several sub-fields. Value clusters: 0x40-0x58 (ACC-related states), 0x4F/0x5F (idle when engine on), 0x3D-0x3E (before ignition), 0xBE-0xCF (with heartbeat=1 variants). Full VAL_ table requires per-state controlled capture.";
+CM_ BO_ 1205 "0x4B5 - PRIMARY ENGAGEMENT INDICATOR. Byte 0 (ADAS_ENGAGED) is 0 when ADAS is off and nonzero when armed/active. 30+ distinct values observed across sessions (range 0..138): driving-engaged 44-58, stationary ADAS-test 0-82 with fine 2-step granularity, pre-drive check 120-138, specific mode 124, peak 102 during a highway drive. State transitions are SEQUENCED (e.g. disengagement drops 100->98->94->88->84->78->72->68->62 in 2s), implying a packed state-level encoding not just a boolean. Full VAL_ table needs a controlled ADAS engagement-level test.";
+CM_ BO_ 1419 "0x58B - RIGHT turn signal ONLY (10Hz 12B bus 0). Byte 11 bit 1 = TURN_SIGNAL_RIGHT. LEFT is NOT here - it is in 0x112.TURN_SIGNAL_LEFT (byte 14 bit 0) on bus 1. R5 splits the two directions across different messages (unusual; most OEMs pack L+R together). Confirmed over 33k R-blinker ON frames across 5+ driving sessions. Rare byte-11 values 0x82 (bits 1+7), 0x42 (bits 1+6), 0x22 (bits 1+5) appear <0.02% of the time and likely encode stalk-hold / lane-change-assist modifiers - needs more data to decode.";
+CM_ BO_ 550 "Wheel speeds (3 subframes of 16 bytes, 50 Hz). Four wheel-speed signals (FL/FR/RL/RR) correlate 0.999+ with ego speed at scale 0.005 km/h — naming FL/FR/RL/RR is a guess; verify with a slip/turn test. UNK_SPEED_LIKE_A/B (bytes 10-11 / 32-33) were originally labeled VEHICLE_SPEED_A/B with scale 0.01 km/h, but they decode to 29.2 km/h when vehicle is stopped and ~60 km/h when actual speed is 40 — NOT clean km/h. Possibly motor-output speed or a gear-ratio-adjusted wheel speed. Use 0x3FA.VEHICLE_SPEED_KPH for the authoritative ego speed.";
+CM_ BO_ 604 "4-byte 50 Hz message with only 2 active bytes. No room for a real checksum - DATA_A is just byte 0, not a CRC. COUNTER nibble at byte 1 bits 7..4.";
+CM_ BO_ 853 "Opaque 25 Hz 64-byte stream appearing on both buses 0 and 1. Only header bits (1..3 of byte 3) show any structure - rest is full-entropy data. Likely camera/radar telemetry or CRC-protected proprietary payload.";
+CM_ BO_ 1018 "Low-rate vehicle-speed + pedal echo on both buses. VEHICLE_SPEED_LOW_RES is a 6-bit field (0..63) - coarse; precise speed is on 0x226. ACCEL_PEDAL_LOW_RATE has scale 0.5 offset -18.5 matching user's original definition, observed 0..35% - may be a derived/smoothed signal rather than raw pedal.";
+CM_ BO_ 1332 "BODY_534 - body-bus message on bus 1 (24 bytes). Note: the SAME address 0x534 also appears on bus 0 at 12 bytes - this entry describes ONLY the bus-1 variant.";
+CM_ BO_ 1416 "Belts / doors / body state, 24 bytes, 2 subframes of 12 bytes. Each STATUS_* byte is a packed bitfield - decompose into individual booleans as you learn them.";
+CM_ BO_ 1541 "Window control / window-state packet. Body bus, 1 Hz. Most payload is mostly-constant in normal driving.";
+CM_ BO_ 1638 "0x666 - body bus @1Hz. BRAKE_PRESSED_LOW_RATE (byte 5 bit 3) corr +0.80 with decel proxy - secondary brake indicator, but too slow for realtime use. Primary brake is at 0x112 bit 57 (100Hz).";
+CM_ BO_ 1661 "0x67D - MOTOR_RPM - drive motor speed. Raw 12-bit value 0..4095; observed 1986..2060 during a drive of 0..57 km/h (ratio ~37 at top speed matches an R5 E-Tech single-reduction ~9.3:1 gearbox with 195/55R16 tyres). Same address 0x67D also on bus 1, same 8-byte length, believed identical.";
+
+CM_ SG_ 427 STEER_ANGLE "16-bit signed steering wheel angle, 0.1 deg. Raw 0xFFFF decodes to 3276.7 - this is the INVALID/UNAVAILABLE marker (EPS ECU has not yet initialized). Treat value 3276.7 as 'no reading' not a real angle.";
+CM_ SG_ 303 GEAR_STATE "Gear enum (valid when GEAR_ENGAGED=1, PARK_ACTIVE=0): 1=R, 2=N, 3=B, 8=D. Validated across 149 segments with deliberate gear-test drive 2026-04-17--13-23-29.";
+CM_ SG_ 303 PARK_ACTIVE "1 = car in Park. Mutually exclusive with GEAR_ENGAGED. When PARK_ACTIVE=1, GEAR_STATE is nominally 2 (unused during Park).";
+CM_ SG_ 303 GEAR_ENGAGED "1 = a drive gear (R/N/B/D) is engaged. Inverse of PARK_ACTIVE across all 149 segments.";
+
+VAL_ 303 GEAR_STATE 1 "R" 2 "N" 3 "B" 8 "D" ;
+VAL_ 1100 GEAR_DIRECTION 1 "REVERSE" 2 "STATIONARY_PN" 3 "FORWARD_DB" ;
+VAL_ 427 LKAS_STATE 1 "ACTIVE_OR_READY" 2 "SUPPRESSED_BY_DRIVER" 3 "UNAVAILABLE" ;
+VAL_ 1233 FOLLOW_DISTANCE 0 "UNSET" 1 "NEAR" 2 "MID" 3 "FAR" ;
