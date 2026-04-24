@@ -10,6 +10,7 @@ legend = ["LAT_ACCEL_FACTOR", "MAX_LAT_ACCEL_MEASURED", "FRICTION"]
 # PSA angle based controllers
 "PSA_PEUGEOT_208" = [nan, 2.0, nan]
 
+
 # New subarus angle based controllers
 "SUBARU_FORESTER_2022" = [nan, 3.0, nan]
 "SUBARU_OUTBACK_2023" = [nan, 3.0, nan]
@@ -41,6 +42,8 @@ legend = ["LAT_ACCEL_FACTOR", "MAX_LAT_ACCEL_MEASURED", "FRICTION"]
 "COMMA_BODY" = [nan, 1000, nan]
 
 # Totally new cars
+# Renault 5 E-Tech — placeholder values (torque control, not yet tuned on-vehicle)
+"RENAULT_5_ETECH" = [1.5, 1.5, 0.12]
 "RAM_1500_5TH_GEN" = [2.0, 2.0, 0.05]
 "RAM_HD_5TH_GEN" = [1.4, 1.4, 0.05]
 "SUBARU_OUTBACK" = [2.0, 1.5, 0.2]
