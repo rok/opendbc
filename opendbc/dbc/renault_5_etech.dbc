@@ -142,8 +142,10 @@ across 3 heavily-engaged drives 2026-04-21):
   ~0; it activates briefly to correct lane drift.
     - byte 10 = 8-bit TORQUE_CMD (zero at idle, nonzero during corrections)
     - byte 16 = 8-bit CHECKSUM (CRC-8 poly 0x1D, XOR 0xEB, body=bytes 17-23)
-    - byte 17 high nibble = 4-bit COUNTER; byte 17 low nibble = UNK_BYTE17_LO
-      (80 unique values observed — likely a sub-state flag alongside the counter)
+    - byte 17 high nibble = 4-bit COUNTER; byte 17 low nibble = LKA_ACTIVE flag
+      (value 0x6 in 100% of 3576 engaged frames observed 2026-04-24; other
+      values 0/3/4/7 seen when LKA is idle/disabled). Exact semantics of the
+      non-0x6 values pending controlled engagement-state test.
   Note: 0x134 uses tail-positioned CHECKSUM (at byte 16) rather than the
   head-positioned (at byte 4) pattern of other R5 messages, but it IS the
   same CRC-8 algorithm. Bytes 0-9 and 11-15 are constant - the ONLY active
@@ -283,7 +285,7 @@ BO_ 308 LKA_CMD_134: 24 XXX
  SG_ UNK_BYTE9 : 71|2@0+ (1,0) [0|3] "" XXX
  SG_ TORQUE_CMD : 87|8@0+ (1,0) [0|255] "" XXX
  SG_ CHECKSUM : 135|8@0+ (1,0) [0|255] "" XXX
- SG_ UNK_BYTE17_LO : 139|4@0+ (1,0) [0|15] "" XXX
+ SG_ LKA_ACTIVE : 139|4@0+ (1,0) [0|15] "" XXX
  SG_ COUNTER : 143|4@0+ (1,0) [0|15] "" XXX
 
 BO_ 380 EPS_17C: 12 XXX
@@ -625,3 +627,4 @@ VAL_ 303 GEAR_STATE 1 "R" 2 "N" 3 "B" 8 "D" ;
 VAL_ 1100 GEAR_DIRECTION 1 "REVERSE" 2 "STATIONARY_PN" 3 "FORWARD_DB" ;
 VAL_ 427 LKAS_STATE 1 "ACTIVE_OR_READY" 2 "SUPPRESSED_BY_DRIVER" 3 "UNAVAILABLE" ;
 VAL_ 1233 FOLLOW_DISTANCE 0 "UNSET" 1 "NEAR" 2 "MID" 3 "FAR" ;
+VAL_ 308 LKA_ACTIVE 6 "ACTIVE" ;
