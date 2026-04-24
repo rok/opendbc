@@ -12,9 +12,18 @@ class CarState(CarStateBase):
     cp = can_parsers[Bus.pt]
     cp_body = can_parsers[Bus.body]
     ret = structs.CarState()
-    # Bus map (verified 2026-04-23 via cadence analysis on session 2026-04-21--11-46-06):
-    #   bus 0 (pt):   0x08C, 0x12F, 0x17C, 0x1AB, 0x226, 0x58B, 0x5EF, 0x588
-    #   bus 1 (body): 0x112, 0x224, 0x4B5
+    # Bus map (verified 2026-04-23 via cadence analysis; architecture refined 2026-04-24):
+    #   bus 0 (pt):   chassis CAN — 0x08C, 0x12F, 0x17C, 0x1AB, 0x226, 0x3FA, 0x58B, 0x5EF, 0x588
+    #   bus 1 (body): ITS2-FD — 0x112, 0x224, 0x4B5
+    #   bus 2 (cam):  panda relay output (CAR-side of chassis pair under ALLOUTPUT;
+    #                 under SILENT it's a mirror of bus 0 since the relay is closed).
+    # Note: FCAM has 4 CAN pairs on its mini50 16-pin connector (D/E/F/G). Current
+    # comma harness taps D and E; F/G pass through. 0x134 LKA_CMD appears on the
+    # CAR side of the relay meaning either the ADAS emitter uses F/G (bypassing our
+    # intercept) or EPS itself is the emitter — phase-alignment analysis on 43k
+    # historical frames shows 0x17C (EPS telemetry) co-schedules with 0x134 at
+    # 41% mode-fraction, and 0x1AB leads them both by 4ms, consistent with
+    # "0x1AB command -> EPS processes -> 0x134+0x17C status response".
 
     # Wheel speeds (0x226 bus 0, 50Hz, 0.005 km/h scale) — sets vEgo from the 4-wheel mean
     self.parse_wheel_speeds(ret,
@@ -58,7 +67,10 @@ class CarState(CarStateBase):
     ret.cruiseState.available = adas_engaged != 0
     ret.cruiseState.enabled = adas_engaged >= 44  # observed "driving-engaged" band
     ret.cruiseState.standstill = False
-    ret.cruiseState.speed = cp.vl["ACC_SETPOINT_5EF"]["SET_SPEED"] * CV.KPH_TO_MS
+    # Cruise setpoint displayed on the cluster: 0x3FA bytes 10-11 (16-bit BE, scale 0.125 km/h)
+    # Raw 1600 (= 200 km/h) is the UNSET sentinel when cruise has no target — map to 0.
+    raw_set = cp.vl["VEHICLE_SPEED_3FA"]["CRUISE_SET_SPEED"]
+    ret.cruiseState.speed = 0.0 if raw_set >= 200 else raw_set * CV.KPH_TO_MS
 
     # LKAS state (0x1AB byte 9 bits 1-2: 1=active, 2=suppressed, 3=unavailable)
     ret.steerFaultTemporary = cp.vl["STEERING_CTRL_1AB"]["LKAS_STATE"] == 3
@@ -81,6 +93,7 @@ class CarState(CarStateBase):
       ("EPS_17C", 100),
       ("STEERING_CTRL_1AB", 100),
       ("WHEEL_SPEEDS_226", 50),
+      ("VEHICLE_SPEED_3FA", 10),
       ("TURN_SIGNAL_RIGHT_58B", 10),
       ("ACC_SETPOINT_5EF", 1),
       ("BELTS_DOORS_588", 10),
