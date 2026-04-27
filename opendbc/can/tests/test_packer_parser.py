@@ -102,6 +102,22 @@ class TestCanParserPacker(unittest.TestCase):
     parser.update([0, [msg]])
     assert parser.can_valid
 
+  def test_parser_multi_counter_renault_frames_stay_valid(self):
+    parser = CANParser("renault_5_etech", [("STEERING_SENSOR_112", 100)], 1)
+    frames = [
+      bytes.fromhex("00005b057b04e2006000015406b004dbc9c408000161062c04dbc9c410000147079819c4091812c00000000000000000000000000000ffe4ed65897d6426f711"),
+      bytes.fromhex("00005b05c214e20060000154060914dbc9c408000161069514dbc9c410000147074e29c4091812c00000000000000000000000000000ffe7061ae03704f66044"),
+    ]
+
+    prev_left_blinker = None
+    for i, dat in enumerate(frames):
+      updated = parser.update([i, [(0x112, dat, 1)]])
+      assert updated == {0x112}
+      assert parser.can_valid
+      if prev_left_blinker is not None:
+        assert parser.vl["STEERING_SENSOR_112"]["TURN_SIGNAL_LEFT"] == prev_left_blinker
+      prev_left_blinker = parser.vl["STEERING_SENSOR_112"]["TURN_SIGNAL_LEFT"]
+
   def test_parser_no_partial_update(self):
     """
     Ensure that the CANParser doesn't partially update messages with invalid signals (COUNTER/CHECKSUM).
